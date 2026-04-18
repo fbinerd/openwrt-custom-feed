@@ -1,0 +1,36 @@
+#!/bin/sh
+
+changed=0
+
+vx_sections="$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)\.proto='vxlan'/\1/p")"
+
+for s in $vx_sections; do
+	if uci -q get "network.$s.bridge" >/dev/null; then
+		uci -q delete "network.$s.bridge"
+		changed=1
+	fi
+
+	tunlink="$(uci -q get "network.$s.tunlink" || true)"
+	if [ "$tunlink" = "br-lan" ] && uci -q get network.lan >/dev/null; then
+		uci set "network.$s.tunlink=lan"
+		changed=1
+	fi
+done
+
+if [ -n "$vx_sections" ]; then
+	vx_first="$(echo "$vx_sections" | head -n1)"
+	stale_if_sections="$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)\.ifname='vxlan0'/\1/p")"
+
+	for s in $stale_if_sections; do
+		proto="$(uci -q get "network.$s.proto" || true)"
+		[ "$proto" = "vxlan" ] && continue
+		uci set "network.$s.ifname=$vx_first"
+		changed=1
+	done
+fi
+
+if [ "$changed" -eq 1 ]; then
+	uci commit network
+fi
+
+exit 0
