@@ -1,0 +1,188 @@
+#!/bin/sh
+
+[ -n "$ACTION" ] || exit 0
+
+eoip_mac_exists_runtime() {
+    local mac="$(echo "$1" | tr 'A-F' 'a-f')"
+    ip link show 2>/dev/null | awk '/link\/ether/ {print tolower($2)}' | grep -qx "$mac"
+}
+
+eoip_mac_exists_uci_other() {
+    local mac="$(echo "$1" | tr 'A-F' 'a-f')"
+    local exclude="$2"
+    uci -q show network 2>/dev/null | \
+        sed -n "s/^network\.\([^.]*\)\.macaddr='\([^']*\)'/\1 \2/p" | \
+        awk -v m="$mac" -v e="$exclude" '{ if ($1 != e && tolower($2) == m) { found=1 } } END { exit(found ? 0 : 1) }'
+}
+
+eoip_mac_is_valid() {
+    echo "$1" | tr 'A-F' 'a-f' | grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'
+}
+
+eoip_mac_is_zero() {
+    [ "$(echo "$1" | tr 'A-F' 'a-f')" = "00:00:00:00:00:00" ]
+}
+
+eoip_mac_is_unicast() {
+    local mac="$1"
+    local first
+    eoip_mac_is_valid "$mac" || return 1
+    first="${mac%%:*}"
+    first=$((0x$first))
+    [ $((first & 0x01)) -eq 0 ]
+}
+
+eoip_get_router_mac() {
+    local dev mac lan_ifname
+
+    for dev in eth0 eth1 br-lan br-wan wlan0; do
+        [ -r "/sys/class/net/$dev/address" ] || continue
+        mac="$(cat "/sys/class/net/$dev/address" 2>/dev/null | tr 'A-F' 'a-f')"
+        eoip_mac_is_valid "$mac" || continue
+        eoip_mac_is_zero "$mac" && continue
+        eoip_mac_is_unicast "$mac" || continue
+        echo "$mac"
+        return 0
+    done
+
+    lan_ifname="$(uci -q get network.lan.ifname 2>/dev/null)"
+    for dev in $lan_ifname; do
+        [ -r "/sys/class/net/$dev/address" ] || continue
+        mac="$(cat "/sys/class/net/$dev/address" 2>/dev/null | tr 'A-F' 'a-f')"
+        eoip_mac_is_valid "$mac" || continue
+        eoip_mac_is_zero "$mac" && continue
+        eoip_mac_is_unicast "$mac" || continue
+        echo "$mac"
+        return 0
+    done
+
+    return 1
+}
+
+eoip_gen_unique_mac() {
+    local sec="$1"
+    local base
+    local b1 b2 b3 b4 b5 b6
+    local o1 o2 o3 o4 o5 o6 cand i
+
+    base="$(eoip_get_router_mac | tr 'A-F' 'a-f')"
+    eoip_mac_is_valid "$base" || return 1
+    eoip_mac_is_zero "$base" && return 1
+    eoip_mac_is_unicast "$base" || return 1
+
+    IFS=':' read -r b1 b2 b3 b4 b5 b6 <<EOBASE
+$base
+EOBASE
+    o1=$((0x$b1))
+    o2=$((0x$b2))
+    o3=$((0x$b3))
+    o4=$((0x$b4))
+    o5=$((0x$b5))
+    o6=$((0x$b6))
+
+    i=1
+    while [ "$i" -le 2048 ]; do
+        o6=$(( (o6 + 1) & 0xff ))
+        if [ "$o6" -eq 0 ]; then
+            o5=$(( (o5 + 1) & 0xff ))
+            if [ "$o5" -eq 0 ]; then
+                o4=$(( (o4 + 1) & 0xff ))
+                if [ "$o4" -eq 0 ]; then
+                    o3=$(( (o3 + 1) & 0xff ))
+                    if [ "$o3" -eq 0 ]; then
+                        o2=$(( (o2 + 1) & 0xff ))
+                        if [ "$o2" -eq 0 ]; then
+                            o1=$(( (o1 + 1) & 0xff ))
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        cand="$(printf '%02x:%02x:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4" "$o5" "$o6")"
+        eoip_mac_is_zero "$cand" && { i=$((i + 1)); continue; }
+        eoip_mac_is_unicast "$cand" || { i=$((i + 1)); continue; }
+
+        if ! eoip_mac_exists_runtime "$cand" && ! eoip_mac_exists_uci_other "$cand" "$sec"; then
+            echo "$cand"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
+eoip_collect_devs() {
+    uci -q show network 2>/dev/null | \
+        sed -n "s/^network\.\([^.]*\)=interface$/\1/p" | \
+        while IFS= read -r sec; do
+            [ -n "$sec" ] || continue
+            proto="$(uci -q get "network.$sec.proto")"
+            [ "$proto" = "eoip" ] || continue
+
+            dev="$(uci -q get "network.$sec.ifname")"
+            if [ -z "$dev" ]; then
+                dev="$(ifstatus "$sec" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+            fi
+            [ -n "$dev" ] && echo "$dev"
+        done | sort -u
+}
+
+eoip_ifname_has_member() {
+    local ifname="$1"
+    local eoipdevs="$2"
+    local member edev
+
+    if [ -z "$eoipdevs" ]; then
+        echo " $ifname " | grep -Eq ' [^ ]*zeoip[^ ]* ' && return 0
+        return 1
+    fi
+
+    for member in $ifname; do
+        for edev in $eoipdevs; do
+            [ "$member" = "$edev" ] && return 0
+            case "$member" in
+                "$edev".*)
+                    return 0
+                ;;
+            esac
+        done
+    done
+
+    return 1
+}
+
+eoipdevs="$(eoip_collect_devs)"
+
+for sec in $(uci -q show network 2>/dev/null | sed -n "s/^network\.\([^.]*\)=interface$/\1/p" | sort); do
+    type="$(uci -q get "network.$sec.type")"
+    [ "$type" = "bridge" ] || continue
+
+    mac="$(uci -q get "network.$sec.macaddr")"
+    [ -n "$mac" ] && continue
+
+    ifname="$(uci -q get "network.$sec.ifname")"
+    [ -n "$ifname" ] || continue
+
+    eoip_ifname_has_member "$ifname" "$eoipdevs" || continue
+
+    newmac="$(eoip_gen_unique_mac "$sec")"
+    [ -n "$newmac" ] || continue
+
+    uci -q set "network.${sec}.macaddr=$newmac"
+    uci -q commit network
+
+    brdev="$(ifstatus "$sec" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+    [ -n "$brdev" ] || brdev="$(ifstatus "$sec" 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null || true)"
+    if [ -n "$brdev" ] && ip link show dev "$brdev" >/dev/null 2>&1; then
+        ip link set dev "$brdev" address "$newmac" >/dev/null 2>&1 || true
+    fi
+
+    if [ "$INTERFACE" != "$sec" ]; then
+        ifup "$sec" >/dev/null 2>&1
+    fi
+done
+
+exit 0
+

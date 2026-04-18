@@ -1,0 +1,94 @@
+#!/bin/sh
+
+[ -n "$ACTION" ] || exit 0
+
+case "$ACTION" in
+    ifup|iflink)
+        :
+    ;;
+    *)
+        exit 0
+    ;;
+esac
+
+. /lib/functions.sh
+
+changed=0
+started=0
+
+eoip_collect_devs() {
+    uci -q show network 2>/dev/null | \
+        sed -n "s/^network\.\([^.]*\)=interface$/\1/p" | \
+        while IFS= read -r sec; do
+            [ -n "$sec" ] || continue
+            proto="$(uci -q get "network.$sec.proto")"
+            [ "$proto" = "eoip" ] || continue
+
+            dev="$(uci -q get "network.$sec.ifname")"
+            if [ -z "$dev" ]; then
+                dev="$(ifstatus "$sec" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+            fi
+            [ -n "$dev" ] && echo "$dev"
+        done | sort -u
+}
+
+eoip_ifname_has_member() {
+    local ifname="$1"
+    local eoipdevs="$2"
+    local member edev
+
+    if [ -z "$eoipdevs" ]; then
+        echo " $ifname " | grep -Eq ' [^ ]*zeoip[^ ]*(\.[0-9]+)? ' && return 0
+        return 1
+    fi
+
+    for member in $ifname; do
+        for edev in $eoipdevs; do
+            [ "$member" = "$edev" ] && return 0
+            case "$member" in
+                "$edev".*)
+                    return 0
+                ;;
+            esac
+        done
+    done
+
+    return 1
+}
+
+eoip_fix_dhcp_defaults() {
+    local sec="$1"
+    local proto ifname defaultroute st
+
+    config_get proto "$sec" proto
+    [ "$proto" = "dhcp" ] || return 0
+
+    config_get ifname "$sec" ifname
+    [ -n "$ifname" ] || return 0
+
+    eoip_ifname_has_member "$ifname" "$eoipdevs" || return 0
+
+    config_get defaultroute "$sec" defaultroute
+    if [ -z "$defaultroute" ]; then
+        uci -q set "network.${sec}.defaultroute=0"
+        changed=1
+    fi
+
+    st="$(ifstatus "$sec" 2>/dev/null || true)"
+    if ! echo "$st" | grep -q '"up": true' && \
+       ! echo "$st" | grep -q '"pending": true'; then
+        (
+            sleep 2
+            ifup "$sec" >/dev/null 2>&1
+        ) &
+        started=1
+    fi
+}
+
+eoipdevs="$(eoip_collect_devs)"
+config_load network
+config_foreach eoip_fix_dhcp_defaults interface
+
+[ "$changed" -eq 1 ] && uci -q commit network
+[ "$started" -eq 1 ] || exit 0
+
