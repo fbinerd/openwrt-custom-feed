@@ -1,0 +1,64 @@
+#!/bin/sh
+
+[ -n "$ACTION" ] || exit 0
+
+case "$ACTION" in
+	ifup|iflink)
+		:
+	;;
+	*)
+		exit 0
+	;;
+esac
+
+. /lib/functions.sh
+
+changed=0
+started=0
+
+vxlan_fix_dhcp_defaults() {
+	local sec="$1"
+	local proto ifname defaultroute
+
+	config_get proto "$sec" proto
+	[ "$proto" = "dhcp" ] || return 0
+
+	config_get ifname "$sec" ifname
+	case "$ifname" in
+		vxlan*.*)
+			:
+		;;
+		*)
+			return 0
+		;;
+	esac
+
+	config_get defaultroute "$sec" defaultroute
+	if [ -z "$defaultroute" ]; then
+		uci -q set "network.${sec}.defaultroute=0"
+		changed=1
+	fi
+
+	# If a matching vxlan subif exists and this interface is fully down
+	# (not already pending setup), trigger ifup once.
+	if [ -d "/sys/class/net/$ifname" ]; then
+		local st
+		st="$(ifstatus "$sec" 2>/dev/null || true)"
+		if ! echo "$st" | grep -q '"up": true' && \
+		   ! echo "$st" | grep -q '"pending": true'; then
+			(
+				sleep 2
+				ifup "$sec" >/dev/null 2>&1
+			) &
+			started=1
+		fi
+	fi
+}
+
+config_load network
+config_foreach vxlan_fix_dhcp_defaults interface
+
+[ "$changed" -eq 1 ] && uci -q commit network
+
+# Avoid flooding hotplug triggers when no interface needed start.
+[ "$started" -eq 1 ] || exit 0
