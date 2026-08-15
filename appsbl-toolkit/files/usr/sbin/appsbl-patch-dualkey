@@ -1,0 +1,140 @@
+#!/bin/sh
+# Applies the embedded appsbl-dualkey.patch to the live 0:APPSBL MTD
+# partition, so this device's bootloader accepts our own research
+# signing key ALONGSIDE the vendor's - real OEM-signed firmware still
+# verifies first, the extra key is only ever a fallback. Research-only,
+# see appsbl/scripts/appsbl-keytool.py's inject_dual() and
+# appsbl/CLEAN_ROOM_STATUS.md in this project for what dual-key mode
+# actually changes and why. Never for production use.
+#
+# ============================================================
+# WARNING: this tool rewrites your device's bootloader partition.
+# It is experimental, research-only software with no warranty of any
+# kind. Every safety check it has (hash verification, PUBLICKEYBLOB
+# validation, per-block readback) is described in its own source - read
+# it before trusting it. Using it, especially with --yes-really, is
+# entirely at your own risk and your own responsibility. Nobody else
+# is responsible for what happens to your device.
+# ============================================================
+#
+# Manual tool, not run automatically by anything. Run --yes-really
+# from the initramfs (TFTP/serial), not from a normally NAND-booted
+# system: the underlying appsbl-dualkey-patcher already refuses to
+# touch anything whose current content doesn't hash to exactly the
+# stock APPSBL this patch was built against, but 0:APPSBL is still the
+# live bootloader - do this with a serial console open so a failed
+# write can be diagnosed and, if truly necessary, recovered via
+# 0:SBL1's own fallback path.
+#
+# 0:appsbl is `read-only;` in the DTS - a deliberate protection, the same
+# one that keeps sysupgrade from ever touching this partition. Probing,
+# --backup and --show-keys only read, so they work against that as-is
+# (and are not restricted to the initramfs). Actually writing needs
+# kmod-mtd-rw (a package dependency) to lift the write flag first; it is
+# only ever loaded for the duration of the write below and unloaded
+# immediately after, success or failure, so the partition goes back to
+# being unwritable from anywhere else the moment this script exits.
+#
+# Usage:
+#   appsbl-patch-dualkey                    # probe only, writes nothing
+#   appsbl-patch-dualkey --yes-really        # patch and write, initramfs only
+#   appsbl-patch-dualkey --backup <path>     # dump the current partition, read-only
+#   appsbl-patch-dualkey --restore-factory [--yes-really]
+#                                             # reverse the dual-key patch and
+#                                             # restore the exact factory image,
+#                                             # verified against the same
+#                                             # pre_sha256 the forward patch
+#                                             # carries - no separate backup file
+#                                             # needed, initramfs only to write
+#   appsbl-patch-dualkey --write-appsbl <path> [--yes-really]
+#                                             # raw escape hatch: write exactly
+#                                             # this file to 0:APPSBL, no
+#                                             # structural checks at all beyond
+#                                             # its size - the file must be
+#                                             # trusted by whoever supplies it,
+#                                             # initramfs only to write
+#   appsbl-patch-dualkey --show-keys         # print the keys that would be applied
+#   appsbl-patch-dualkey --set-key <name> <base64-value>
+#                                             # replace a key; rejected (and not
+#                                             # written) unless it is the exact
+#                                             # slot length and a well-formed,
+#                                             # correctly-sized PUBLICKEYBLOB
+
+. /lib/functions.sh
+. /lib/upgrade/common.sh
+
+case "$(board_name)" in
+mercusys,mr80x-v2|\
+mercusys,mr80x-v5) ;;
+*)
+	echo "appsbl-patch-dualkey: not a Mercusys MR80X v2/v5, refusing" >&2
+	exit 1
+	;;
+esac
+
+if [ "$1" = "--show-keys" ]; then
+	exec appsbl-dualkey-patcher --show-keys
+fi
+
+if [ "$1" = "--set-key" ]; then
+	exec appsbl-dualkey-patcher --set-key "$2" "$3"
+fi
+
+mtdnum="$(find_mtd_index 0:appsbl)"
+if [ -z "$mtdnum" ]; then
+	echo "appsbl-patch-dualkey: cannot find the 0:APPSBL MTD partition" >&2
+	exit 1
+fi
+
+if [ "$1" = "--backup" ]; then
+	if [ -z "$2" ]; then
+		echo "usage: appsbl-patch-dualkey --backup <path>" >&2
+		exit 1
+	fi
+	# Read-only: works regardless of the read-only DTS flag and regardless
+	# of rootfs_type, same as probing.
+	if dd if="/dev/mtd$mtdnum" of="$2" bs=131072 2>/dev/null; then
+		# umask at creation time can leave this 0600 - uhttpd refuses to
+		# serve a file it doesn't consider world-readable even running as
+		# root, which silently 403s any download link pointing at it.
+		chmod 644 "$2" 2>/dev/null
+		echo "appsbl-patch-dualkey: backed up /dev/mtd$mtdnum (0:appsbl) to $2"
+		exit 0
+	else
+		echo "appsbl-patch-dualkey: backup failed" >&2
+		exit 1
+	fi
+fi
+
+echo "appsbl-patch-dualkey: WARNING - this tool rewrites your bootloader partition." >&2
+echo "Research-only, no warranty. Use entirely at your own risk." >&2
+
+if [ "$(rootfs_type)" != "tmpfs" ]; then
+	echo "appsbl-patch-dualkey: refusing to run outside an initramfs" >&2
+	echo "(rootfs_type=$(rootfs_type)) - boot the initramfs image over TFTP/serial first" >&2
+	exit 1
+fi
+
+commit=0
+for arg in "$@"; do
+	[ "$arg" = "--yes-really" ] && commit=1
+done
+
+if [ "$commit" = "1" ]; then
+	# BusyBox modprobe doesn't reliably forward key=value module
+	# parameters to insmod on this build, and mtd-rw refuses to do
+	# anything without seeing i_want_a_brick=1 explicitly - go straight
+	# to insmod with the full .ko path instead.
+	mtdrw_ko="/lib/modules/$(uname -r)/mtd-rw.ko"
+	if [ ! -f "$mtdrw_ko" ] || ! insmod "$mtdrw_ko" i_want_a_brick=1; then
+		echo "appsbl-patch-dualkey: failed to load kmod-mtd-rw, refusing to proceed" >&2
+		exit 1
+	fi
+fi
+
+appsbl-dualkey-patcher "/dev/mtd$mtdnum" "$@"
+ret=$?
+
+[ "$commit" = "1" ] && rmmod mtd-rw 2>/dev/null
+
+exit $ret

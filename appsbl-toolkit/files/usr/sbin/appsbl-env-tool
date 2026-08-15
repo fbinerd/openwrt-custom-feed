@@ -1,0 +1,193 @@
+#!/bin/sh
+# appsbl-env-tool - reads, backs up, and edits the U-Boot environment
+# partition (0:appsblenv) on a Mercusys MR80X v2/v5. Wraps uboot-envtools'
+# fw_printenv/fw_setenv (which already understand this env format and its
+# CRC) instead of reimplementing env parsing here.
+#
+# ============================================================
+# WARNING: this tool can rewrite your device's U-Boot environment,
+# including bootcmd. It is experimental, research-only software with no
+# warranty of any kind. Using it, especially --set/--restore-baseline/
+# --write-env with --yes-really, is entirely at your own risk and your
+# own responsibility. Nobody else is responsible for what happens to
+# your device.
+# ============================================================
+#
+# This project has NO captured reference for a genuine, untouched
+# OEM-factory 0:appsblenv - only for this project's OWN known-good state
+# (see --restore-baseline below). Nothing here claims otherwise.
+#
+# --set never restricts which variable you touch - that is the point of
+# it (a free-edit escape hatch). --restore-baseline is deliberately the
+# opposite: it ONLY ever touches bootcmd/bootdelay/tp_boot_idx (the three
+# variables mercusys_mr80x_set_bootenv() in this project's own
+# target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
+# sets on every install/sysupgrade) and never touches device-unique
+# fields such as ethaddr/eth1addr/eth6addr.
+#
+# Usage:
+#   appsbl-env-tool --show                    # print all current envs (fw_printenv), read-only
+#   appsbl-env-tool --backup <path>            # raw dd of 0:appsblenv, read-only
+#   appsbl-env-tool --set <name> <value> [--yes-really]
+#                                               # fw_setenv wrapper - free edit, any variable
+#   appsbl-env-tool --unset <name> [--yes-really]
+#                                               # fw_setenv wrapper with no value - deletes
+#                                               # the variable entirely (not the same as
+#                                               # setting it to an empty string)
+#   appsbl-env-tool --restore-baseline [--yes-really]
+#                                               # resets ONLY bootcmd/bootdelay/tp_boot_idx to
+#                                               # this project's own known-good values
+#   appsbl-env-tool --write-env <file> [--yes-really]
+#                                               # raw escape hatch: write exactly this file to
+#                                               # 0:appsblenv, only the size is checked
+
+. /lib/functions.sh
+. /lib/upgrade/common.sh
+
+case "$(board_name)" in
+mercusys,mr80x-v2|\
+mercusys,mr80x-v5) ;;
+*)
+	echo "appsbl-env-tool: not a Mercusys MR80X v2/v5, refusing" >&2
+	exit 1
+	;;
+esac
+
+PART_SIZE=524288 # 0:appsblenv: 0x80000, see ipq5018-mr80x-v5.dts / v2.dts (same layout)
+
+mtdnum="$(find_mtd_index 0:appsblenv)"
+if [ -z "$mtdnum" ]; then
+	echo "appsbl-env-tool: cannot find the 0:appsblenv MTD partition" >&2
+	exit 1
+fi
+
+if [ "$1" = "--show" ]; then
+	exec fw_printenv
+fi
+
+if [ "$1" = "--backup" ]; then
+	if [ -z "$2" ]; then
+		echo "usage: appsbl-env-tool --backup <path>" >&2
+		exit 1
+	fi
+	# Read-only: works regardless of rootfs_type, same as appsbl-patch-dualkey --backup.
+	if dd if="/dev/mtd$mtdnum" of="$2" bs=131072 2>/dev/null; then
+		chmod 644 "$2" 2>/dev/null
+		echo "appsbl-env-tool: backed up /dev/mtd$mtdnum (0:appsblenv) to $2"
+		exit 0
+	else
+		echo "appsbl-env-tool: backup failed" >&2
+		exit 1
+	fi
+fi
+
+echo "appsbl-env-tool: WARNING - this tool can rewrite your device's U-Boot environment." >&2
+echo "Research-only, no warranty. Use entirely at your own risk." >&2
+
+if [ "$(rootfs_type)" != "tmpfs" ]; then
+	echo "appsbl-env-tool: refusing to run outside an initramfs" >&2
+	echo "(rootfs_type=$(rootfs_type)) - boot the initramfs image over TFTP/serial first" >&2
+	exit 1
+fi
+
+commit=0
+for arg in "$@"; do
+	[ "$arg" = "--yes-really" ] && commit=1
+done
+
+if [ "$1" = "--set" ]; then
+	name="$2"
+	value="$3"
+	if [ -z "$name" ]; then
+		echo "usage: appsbl-env-tool --set <name> <value> [--yes-really]" >&2
+		exit 1
+	fi
+	if [ "$commit" != "1" ]; then
+		echo "appsbl-env-tool: would set '$name' = '$value' (pass --yes-really to write)"
+		exit 0
+	fi
+	if fw_setenv "$name" "$value"; then
+		echo "appsbl-env-tool: set '$name' = '$value'"
+		exit 0
+	else
+		echo "appsbl-env-tool: fw_setenv failed" >&2
+		exit 1
+	fi
+fi
+
+if [ "$1" = "--unset" ]; then
+	name="$2"
+	if [ -z "$name" ]; then
+		echo "usage: appsbl-env-tool --unset <name> [--yes-really]" >&2
+		exit 1
+	fi
+	if [ "$commit" != "1" ]; then
+		echo "appsbl-env-tool: would delete '$name' (pass --yes-really to write)"
+		exit 0
+	fi
+	# fw_setenv with a name and no value deletes that variable - this is
+	# NOT the same as --set <name> "" (which sets it to an empty string).
+	if fw_setenv "$name"; then
+		echo "appsbl-env-tool: deleted '$name'"
+		exit 0
+	else
+		echo "appsbl-env-tool: fw_setenv failed" >&2
+		exit 1
+	fi
+fi
+
+if [ "$1" = "--restore-baseline" ]; then
+	if [ "$commit" != "1" ]; then
+		echo "appsbl-env-tool: would set bootcmd=bootipq, bootdelay=1, tp_boot_idx=0 (pass --yes-really to write)"
+		exit 0
+	fi
+	if fw_setenv -s - <<-EOF
+		bootcmd bootipq
+		bootdelay 1
+		tp_boot_idx 0
+	EOF
+	then
+		echo "appsbl-env-tool: restored bootcmd/bootdelay/tp_boot_idx to this project's known-good values"
+		exit 0
+	else
+		echo "appsbl-env-tool: fw_setenv failed" >&2
+		exit 1
+	fi
+fi
+
+if [ "$1" = "--write-env" ]; then
+	file="$2"
+	if [ -z "$file" ]; then
+		echo "usage: appsbl-env-tool --write-env <file> [--yes-really]" >&2
+		exit 1
+	fi
+	size="$(wc -c < "$file" 2>/dev/null)"
+	if [ "$size" != "$PART_SIZE" ]; then
+		echo "appsbl-env-tool: $file is $size bytes, expected exactly $PART_SIZE (0:appsblenv) - refusing" >&2
+		exit 1
+	fi
+	echo "appsbl-env-tool: $file is exactly $PART_SIZE bytes - no structural checks are done in this mode"
+	if [ "$commit" != "1" ]; then
+		echo "appsbl-env-tool: probe successful; no data was written (pass --yes-really to write)"
+		exit 0
+	fi
+	# NAND needs an erase cycle before writing - plain dd to the MTD char
+	# device does not do that. Use the mtd tool (already a package
+	# dependency), which erases+writes+verifies per block, same as
+	# flashing appsbl itself. mtd accepts the partition LABEL directly.
+	if mtd write "$file" 0:appsblenv; then
+		echo "appsbl-env-tool: 0:appsblenv fully rewritten from $file"
+		exit 0
+	else
+		echo "appsbl-env-tool: write failed" >&2
+		exit 1
+	fi
+fi
+
+echo "usage: appsbl-env-tool --show" >&2
+echo "       appsbl-env-tool --backup <path>" >&2
+echo "       appsbl-env-tool --set <name> <value> [--yes-really]" >&2
+echo "       appsbl-env-tool --unset <name> [--yes-really]" >&2
+echo "       appsbl-env-tool --restore-baseline [--yes-really]" >&2
+echo "       appsbl-env-tool --write-env <file> [--yes-really]" >&2
+exit 1

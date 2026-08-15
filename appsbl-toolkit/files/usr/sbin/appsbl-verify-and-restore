@@ -1,0 +1,76 @@
+#!/bin/sh
+# appsbl-verify-and-restore - validates an uploaded official Mercusys
+# firmware image's RSA signature against the REAL vendor key
+# (appsbl-verify-image, linked against TP-Link/Mercusys's own vendor
+# rsaVerify.c), and only if that signature is valid, uses it as
+# authorization to originalize 0:appsblenv - restore this project's own
+# known-good baseline (bootcmd/bootdelay/tp_boot_idx only, see
+# appsbl-env-tool --restore-baseline; device-unique fields like ethaddr
+# are never touched here).
+#
+# ============================================================
+# WARNING: this can rewrite your device's U-Boot environment and, with
+# --unpatch-appsbl, the bootloader partition itself. Research-only, no
+# warranty, entirely at your own risk.
+# ============================================================
+#
+# The uploaded image's PAYLOAD (kernel/rootfs) is never read for
+# anything beyond the signature check itself - the actual restore
+# actions reuse this project's own already-verified mechanisms
+# (appsbl-env-tool --restore-baseline, appsbl-patch-dualkey
+# --restore-factory), neither of which reads anything from the
+# uploaded file.
+#
+# --unpatch-appsbl (default: off) additionally reverses the dual-key
+# patch on 0:appsbl back to the exact stock image, i.e. removes the
+# fallback key entirely and returns to single-key (vendor-only)
+# verification - the same effect as appsbl-patch-dualkey
+# --restore-factory, gated behind the same validated-image check.
+#
+# Usage:
+#   appsbl-verify-and-restore <image-file> [--unpatch-appsbl] [--yes-really]
+
+image="$1"
+shift
+
+if [ -z "$image" ] || [ ! -f "$image" ]; then
+	echo "usage: appsbl-verify-and-restore <image-file> [--unpatch-appsbl] [--yes-really]" >&2
+	exit 1
+fi
+
+unpatch=0
+commit=0
+for arg in "$@"; do
+	case "$arg" in
+	--unpatch-appsbl) unpatch=1 ;;
+	--yes-really) commit=1 ;;
+	esac
+done
+
+if ! appsbl-verify-image "$image"; then
+	echo "appsbl-verify-and-restore: refusing - image signature did not validate against the real vendor key" >&2
+	exit 1
+fi
+
+env_args="--restore-baseline"
+[ "$commit" = "1" ] && env_args="$env_args --yes-really"
+# shellcheck disable=SC2086
+if ! appsbl-env-tool $env_args; then
+	echo "appsbl-verify-and-restore: env restore step failed" >&2
+	exit 1
+fi
+
+if [ "$unpatch" = "1" ]; then
+	patch_args="--restore-factory"
+	[ "$commit" = "1" ] && patch_args="$patch_args --yes-really"
+	# shellcheck disable=SC2086
+	if ! appsbl-patch-dualkey $patch_args; then
+		echo "appsbl-verify-and-restore: appsbl unpatch (restore-factory) step failed" >&2
+		exit 1
+	fi
+fi
+
+if [ "$commit" != "1" ]; then
+	echo "appsbl-verify-and-restore: probe successful; no data was written (pass --yes-really to write)"
+fi
+echo "appsbl-verify-and-restore: done"
