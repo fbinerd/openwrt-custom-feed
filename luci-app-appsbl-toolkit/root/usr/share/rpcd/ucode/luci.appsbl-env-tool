@@ -1,0 +1,167 @@
+/* luci.appsbl-env-tool.uc
+ *
+ * Thin ubus wrapper around /usr/sbin/appsbl-env-tool and
+ * /usr/sbin/appsbl-verify-and-restore. All the actual safety logic
+ * (board check, rootfs_type=tmpfs gate, MTD lookup, RSA signature
+ * verification against the real vendor key) lives in those tools - this
+ * file only runs them and returns their output.
+ *
+ * WARNING: set_env/restore_baseline/write_env/verify_and_restore can
+ * change your device's U-Boot environment or bootloader. Research-only
+ * tool, no warranty, entirely at the caller's own risk.
+ *
+ * Exposes ubus object: luci.appsbl-env-tool
+ * Methods:
+ *   - show_env           (read)  appsbl-env-tool --show (fw_printenv), all current vars
+ *   - list_env            (read)  same data as show_env, parsed into
+ *                                 [{name, value}, ...] for the list UI
+ *   - backup              (read)  dumps 0:appsblenv to /www under a random name,
+ *                                 returns that URL - same reasoning as
+ *                                 luci.appsbl-dualkey-patch's backup (ubus
+ *                                 30s timeout vs base64-encoding ~512KiB)
+ *   - set_env             (write) appsbl-env-tool --set <name> <value> --yes-really -
+ *                                 free edit, any variable, no restrictions
+ *   - remove_env          (write) appsbl-env-tool --unset <name> --yes-really -
+ *                                 deletes the variable entirely
+ *   - restore_baseline    (write) appsbl-env-tool --restore-baseline --yes-really -
+ *                                 ONLY bootcmd/bootdelay/tp_boot_idx, never
+ *                                 device-unique fields
+ *   - write_env           (write) appsbl-env-tool --write-env on whatever was
+ *                                 uploaded to /tmp/appsbl-env-upload.bin via
+ *                                 cgi-upload - no structural checks beyond size
+ *   - verify_and_restore  (write) appsbl-verify-and-restore on whatever was
+ *                                 uploaded to /tmp/appsbl-verify-upload.bin -
+ *                                 validates the file's RSA signature against
+ *                                 the real vendor key first, and only if valid,
+ *                                 restores the env baseline and (if unpatch=true)
+ *                                 also reverses the dual-key patch on 0:appsbl
+ *
+ * Tests:
+ * ubus -S call luci.appsbl-env-tool show_env
+ * ubus -S call luci.appsbl-env-tool backup
+ * ubus -S call luci.appsbl-env-tool set_env '{"name":"bootdelay","value":"1"}'
+ * ubus -S call luci.appsbl-env-tool restore_baseline
+ * ubus -S call luci.appsbl-env-tool write_env
+ * ubus -S call luci.appsbl-env-tool verify_and_restore '{"unpatch":false}'
+ */
+
+"use strict";
+
+import * as fs from "fs";
+
+function shellquote(s) {
+	return `'${replace(s ?? "", "'", "'\\''")}'`;
+}
+
+function run(cmd) {
+	let out = fs.popen(cmd + " 2>&1; echo RC=$?")?.read?.("all") ?? "";
+	let m = match(out, /RC=([0-9]+)\s*$/);
+	let rc = m ? int(m[1]) : -1;
+	let text = replace(out, /RC=[0-9]+\s*$/, "");
+	return { output: trim(text), rc: rc, ok: rc == 0 };
+}
+
+function show_env() {
+	return run("appsbl-env-tool --show");
+}
+
+function list_env() {
+	let res = run("appsbl-env-tool --show");
+
+	if (!res.ok)
+		return res;
+
+	let vars = [];
+	for (let line in split(res.output, "\n")) {
+		let eq = index(line, "=");
+		if (eq < 0)
+			continue;
+		push(vars, { name: substr(line, 0, eq), value: substr(line, eq + 1) });
+	}
+
+	return { ok: true, rc: 0, vars: vars };
+}
+
+function backup() {
+	let token = trim(fs.popen("head -c8 /dev/urandom | hexdump -v -e '8/1 \"%02x\"'")?.read?.("all") ?? "");
+
+	if (!token || length(token) != 16)
+		token = "fallback" + time();
+
+	let filename = "appsbl-env-backup-" + token + ".bin";
+	let res = run("appsbl-env-tool --backup " + shellquote("/www/" + filename));
+
+	if (!res.ok)
+		return res;
+
+	return { ok: true, rc: 0, output: res.output, filename: filename, url: "/" + filename };
+}
+
+function set_env(req) {
+	let name = req?.args?.name;
+	let value = req?.args?.value;
+
+	if (!name || value == null)
+		return { ok: false, rc: -1, output: "missing name or value" };
+
+	return run("appsbl-env-tool --set " + shellquote(name) + " " + shellquote(value) + " --yes-really");
+}
+
+function remove_env(req) {
+	let name = req?.args?.name;
+
+	if (!name)
+		return { ok: false, rc: -1, output: "missing name" };
+
+	return run("appsbl-env-tool --unset " + shellquote(name) + " --yes-really");
+}
+
+function restore_baseline() {
+	return run("appsbl-env-tool --restore-baseline --yes-really");
+}
+
+const ENV_UPLOAD_PATH = "/tmp/appsbl-env-upload.bin";
+
+function write_env() {
+	if (!fs.access(ENV_UPLOAD_PATH))
+		return { ok: false, rc: -1, output: "no file uploaded to " + ENV_UPLOAD_PATH + " yet" };
+
+	let res = run("appsbl-env-tool --write-env " + shellquote(ENV_UPLOAD_PATH) + " --yes-really");
+
+	fs.unlink(ENV_UPLOAD_PATH);
+
+	return res;
+}
+
+const VERIFY_UPLOAD_PATH = "/tmp/appsbl-verify-upload.bin";
+
+function verify_and_restore(req) {
+	let unpatch = req?.args?.unpatch ? true : false;
+
+	if (!fs.access(VERIFY_UPLOAD_PATH))
+		return { ok: false, rc: -1, output: "no file uploaded to " + VERIFY_UPLOAD_PATH + " yet" };
+
+	let cmd = "appsbl-verify-and-restore " + shellquote(VERIFY_UPLOAD_PATH);
+	if (unpatch)
+		cmd += " --unpatch-appsbl";
+	cmd += " --yes-really";
+
+	let res = run(cmd);
+
+	fs.unlink(VERIFY_UPLOAD_PATH);
+
+	return res;
+}
+
+const methods = {
+	show_env: { call: show_env },
+	list_env: { call: list_env },
+	backup: { call: backup },
+	set_env: { args: { name: "String", value: "String" }, call: set_env },
+	remove_env: { args: { name: "String" }, call: remove_env },
+	restore_baseline: { call: restore_baseline },
+	write_env: { call: write_env },
+	verify_and_restore: { args: { unpatch: true }, call: verify_and_restore },
+};
+
+return { "luci.appsbl-env-tool": methods };

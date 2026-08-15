@@ -1,0 +1,157 @@
+/* luci.appsbl-dualkey-patch.uc
+ *
+ * Thin ubus wrapper around /usr/sbin/appsbl-patch-dualkey. All the actual
+ * safety logic (board check, rootfs_type=tmpfs gate, MTD lookup, the two
+ * SHA-256 verifications before any flash write, PUBLICKEYBLOB validation)
+ * lives in that script and the C tool it execs - this file only runs it
+ * and returns its output, it does not duplicate any of those checks.
+ *
+ * WARNING: apply and set_key can change what your bootloader will accept
+ * as a valid signature. Research-only tool, no warranty, entirely at the
+ * caller's own risk.
+ *
+ * Exposes ubus object: luci.appsbl-dualkey-patch
+ * Methods:
+ *   - probe           (read)  runs appsbl-patch-dualkey with no arguments -
+ *                              writes nothing
+ *   - apply           (write) runs appsbl-patch-dualkey --yes-really -
+ *                              writes to 0:APPSBL
+ *   - get_keys        (read)  returns the current value of both editable
+ *                              key fields
+ *   - set_key         (write) validates and replaces one key field;
+ *                              rejected (and not written) unless it is the
+ *                              exact expected slot length and a well-formed,
+ *                              correctly-sized PUBLICKEYBLOB
+ *   - backup          (read)  dumps the current 0:APPSBL to /www under a
+ *                              random, unguessable name and returns that
+ *                              URL - ubus calls time out at 30s, and
+ *                              base64-encoding the ~1.25 MiB partition in
+ *                              ucode routinely takes longer than that on
+ *                              this hardware, so the previous approach
+ *                              (returning the data inline, base64-encoded,
+ *                              in the ubus response) reliably failed; this
+ *                              way the only thing the ubus call waits on is
+ *                              the dd-equivalent read, and the actual
+ *                              transfer happens over a plain HTTP GET the
+ *                              browser issues afterwards
+ *   - restore_factory (write) runs appsbl-patch-dualkey --restore-factory
+ *                              --yes-really - reverses the dual-key patch
+ *                              and restores the exact factory image,
+ *                              verified against the same factory hash the
+ *                              forward patch carries; no prior backup
+ *                              needed
+ *   - write_appsbl    (write) runs appsbl-patch-dualkey --write-appsbl on
+ *                              whatever was uploaded to /tmp/appsbl-upload.bin
+ *                              via cgi-upload (see the view's JS - a plain
+ *                              multipart POST, not base64-through-ubus, for
+ *                              the same 30s/size reason as backup above) -
+ *                              no structural checks beyond size, the
+ *                              uploaded file is trusted as-is
+ *
+ * Tests:
+ * ubus -S call luci.appsbl-dualkey-patch probe
+ * ubus -S call luci.appsbl-dualkey-patch get_keys
+ * ubus -S call luci.appsbl-dualkey-patch set_key '{"name":"legacy-rsa1024","value":"..."}'
+ * ubus -S call luci.appsbl-dualkey-patch backup
+ * ubus -S call luci.appsbl-dualkey-patch restore_factory
+ * ubus -S call luci.appsbl-dualkey-patch write_appsbl
+ */
+
+"use strict";
+
+import * as fs from "fs";
+
+const KEY_META = {
+	"firmware-rsa2048": { bits: 2048 },
+	"legacy-rsa1024": { bits: 1024 },
+};
+
+function shellquote(s) {
+	return `'${replace(s ?? "", "'", "'\\''")}'`;
+}
+
+function run(extra_args) {
+	let cmd = "appsbl-patch-dualkey" + extra_args + " 2>&1; echo RC=$?";
+	let out = fs.popen(cmd)?.read?.("all") ?? "";
+	let m = match(out, /RC=([0-9]+)\s*$/);
+	let rc = m ? int(m[1]) : -1;
+	let text = replace(out, /RC=[0-9]+\s*$/, "");
+	return { output: trim(text), rc: rc, ok: rc == 0 };
+}
+
+function probe() {
+	return run("");
+}
+
+function apply() {
+	return run(" --yes-really");
+}
+
+function restore_factory() {
+	return run(" --restore-factory --yes-really");
+}
+
+const UPLOAD_PATH = "/tmp/appsbl-upload.bin";
+
+function write_appsbl() {
+	if (!fs.access(UPLOAD_PATH))
+		return { ok: false, rc: -1, output: "no file uploaded to " + UPLOAD_PATH + " yet" };
+
+	let res = run(" --write-appsbl " + shellquote(UPLOAD_PATH) + " --yes-really");
+
+	fs.unlink(UPLOAD_PATH);
+
+	return res;
+}
+
+function get_keys() {
+	let result = {};
+
+	for (let name in KEY_META) {
+		let path = "/etc/appsbl-dualkey/" + name + ".b64";
+		let value = trim(fs.readfile(path) ?? "");
+
+		result[name] = { value: value, bits: KEY_META[name].bits };
+	}
+
+	return result;
+}
+
+function set_key(req) {
+	let name = req?.args?.name;
+	let value = req?.args?.value;
+
+	if (!name || value == null)
+		return { ok: false, rc: -1, output: "missing name or value" };
+	if (!(name in KEY_META))
+		return { ok: false, rc: -1, output: `unknown key field '${name}'` };
+
+	return run(" --set-key " + shellquote(name) + " " + shellquote(value));
+}
+
+function backup() {
+	let token = trim(fs.popen("head -c8 /dev/urandom | hexdump -v -e '8/1 \"%02x\"'")?.read?.("all") ?? "");
+
+	if (!token || length(token) != 16)
+		token = "fallback" + time();
+
+	let filename = "appsbl-backup-" + token + ".bin";
+	let res = run(" --backup " + shellquote("/www/" + filename));
+
+	if (!res.ok)
+		return res;
+
+	return { ok: true, rc: 0, output: res.output, filename: filename, url: "/" + filename };
+}
+
+const methods = {
+	probe: { call: probe },
+	apply: { call: apply },
+	get_keys: { call: get_keys },
+	set_key: { args: { name: "String", value: "String" }, call: set_key },
+	backup: { call: backup },
+	restore_factory: { call: restore_factory },
+	write_appsbl: { call: write_appsbl },
+};
+
+return { "luci.appsbl-dualkey-patch": methods };

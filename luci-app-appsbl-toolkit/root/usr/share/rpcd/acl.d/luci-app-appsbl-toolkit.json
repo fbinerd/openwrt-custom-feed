@@ -1,0 +1,23 @@
+{
+	"luci-app-appsbl-toolkit": {
+		"description": "Grant access for luci-app-appsbl-toolkit",
+		"read": {
+			"ubus": {
+				"luci.appsbl-dualkey-patch": [ "probe", "get_keys", "backup" ],
+				"luci.appsbl-env-tool": [ "show_env", "list_env", "backup" ]
+			}
+		},
+		"write": {
+			"cgi-io": [ "upload" ],
+			"file": {
+				"/tmp/appsbl-upload.bin": [ "write" ],
+				"/tmp/appsbl-env-upload.bin": [ "write" ],
+				"/tmp/appsbl-verify-upload.bin": [ "write" ]
+			},
+			"ubus": {
+				"luci.appsbl-dualkey-patch": [ "apply", "set_key", "restore_factory", "write_appsbl" ],
+				"luci.appsbl-env-tool": [ "set_env", "remove_env", "restore_baseline", "write_env", "verify_and_restore" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,48 @@
+{
+	"admin/system/appsbl-toolkit": {
+		"title": "APPSBL Toolkit",
+		"order": 71,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-appsbl-toolkit" ]
+		}
+	},
+
+	"admin/system/appsbl-toolkit/dualkey": {
+		"title": "Dual-Key Patch",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "system/appsbl-dualkey-patch"
+		},
+		"depends": {
+			"acl": [ "luci-app-appsbl-toolkit" ]
+		}
+	},
+
+	"admin/system/appsbl-toolkit/env": {
+		"title": "Environment (envs)",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "system/appsbl-env"
+		},
+		"depends": {
+			"acl": [ "luci-app-appsbl-toolkit" ]
+		}
+	},
+
+	"admin/system/appsbl-toolkit/recovery": {
+		"title": "OEM Recovery",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "system/appsbl-recovery"
+		},
+		"depends": {
+			"acl": [ "luci-app-appsbl-toolkit" ]
+		}
+	}
+}
