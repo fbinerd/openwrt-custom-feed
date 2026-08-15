@@ -1,0 +1,17 @@
+{
+  "format": "MR80X APPSBL firmware verification keys",
+  "keys": {
+    "firmware-rsa2048": {
+      "bits": 2048,
+      "exponent": 65537,
+      "public_pem_sha256": "ddabc415322a39d553f6c0cbf58285b3f6875a252b4f11a563c5dce270142e89",
+      "publickeyblob_sha256": "e1330ffc0fe32b379a61c7ebfd646aafd568a522055fe95bdc69ed1932b8a597"
+    },
+    "legacy-rsa1024": {
+      "bits": 1024,
+      "exponent": 65537,
+      "public_pem_sha256": "c8bd165f5d199af17d667a2806728fb643746a399dc88bf194dff413d15d1b47",
+      "publickeyblob_sha256": "c247ede81c859927241b4aacc02fcae91a399c201acfcfd8e7571597f41d7150"
+    }
+  }
+}
